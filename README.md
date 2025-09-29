@@ -1,0 +1,2 @@
+# testofatestofatestmindbox
+Тестовое задание MIndbox
