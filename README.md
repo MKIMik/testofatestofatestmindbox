@@ -1,2 +1,2 @@
 # testofatestofatestmindbox
-Тестовое задание MIndbox
+Тестовое задание Mindbox
