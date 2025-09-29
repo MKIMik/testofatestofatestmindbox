@@ -1,0 +1,217 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: web-app-service
+  annotations:
+    # Используем ClusterIP как безопасный выбор по умолчанию.
+    service.alpha.kubernetes.io/tolerate-unready-endpoints: "true"
+spec:
+  selector:
+    app: web-app
+  ports:
+  - port: 80
+    targetPort: 8080
+    protocol: TCP
+  type: ClusterIP
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web-app
+  labels:
+    app: web-app
+    version: "v1.2.3"  # Явное указание версии для трассируемости
+spec:
+  # 4 реплики для немедленной готовности к пиковой нагрузке
+  # Обоснование: Нагрузочное тестирование показало, что 4 пода справляются с пиком.
+  #              Запуск 4 реплик сразу покрывает все 3 зоны и обеспечивает
+  #              мгновенную доступность без ожидания масштабирования HPA
+  replicas: 4
+  
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # maxSurge=1 и maxUnavailable=0 обеспечивают
+      # zero-downtime deployments с минимальным потреблением ресурсов во время обновлений
+      maxSurge: 1        # Одновременно может быть на 1 под больше желаемого
+      maxUnavailable: 0  # Гарантирует, что старые поды не удаляются до готовности новых
+  
+  selector:
+    matchLabels:
+      app: web-app
+  
+  template:
+    metadata:
+      labels:
+        app: web-app
+        version: "v1.2.3"  # Версионность для точного отслеживания
+      annotations:
+        # Мониторинг: аннотации для Prometheus и других систем наблюдения
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/metrics"
+    
+    spec:
+      # =========================================================================
+      # РАСПРЕДЕЛЕНИЕ И ОТКАЗОУСТОЙЧИВОСТЬ
+      # =========================================================================
+      topologySpreadConstraints:
+      - maxSkew: 1
+        topologyKey: topology.kubernetes.io/zone
+        # DoNotSchedule гарантирует строгое распределение по зонам
+        # Риск: Может заблокировать создание подов при проблемах в одной зоне
+        # Компромисс: Безопасность над доступностью для критичных workload
+        whenUnsatisfiable: DoNotSchedule
+        labelSelector:
+          matchLabels:
+            app: web-app
+      
+      affinity:
+        podAntiAffinity:
+          # requiredDuringScheduling гарантирует размещение на разных нодах
+          # Обоснование: При 5 нодах и 4 репликах это обеспечивает максимальную отказоустойчивость
+          # Риск: Требует достаточного количества нод (минимум 4 для 4 реплик)
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchLabels:
+                app: web-app
+            topologyKey: kubernetes.io/hostname
+      
+      containers:
+      - name: web-app
+        # Конкретная версия тега вместо latest
+        # Предотвращает непреднамеренные обновления и обеспечивает воспроизводимость
+        image: your-registry/web-app:v1.2.3
+        
+        
+        resources:
+          requests:
+            memory: "128Mi"   # Соответствует стабильному потреблению памяти
+            cpu: "250m"       # Повышенный request покрывает стартовый всплеск CPU
+                              # Обоснование: Предотвращает starvation при инициализации
+                              # и помогает scheduler'у выбрать правильные ноды
+            
+          limits:
+            memory: "256Mi"   # Лимит с запасом 2x для непредвиденных пиков памяти
+            cpu: "500m"       # Ограничивает максимальное потребление, защищая ноду
+        
+        # =========================================================================
+        # HEALTH CHECKS - РАЗДЕЛЕННЫЕ ЭНДПОИНТЫ ДЛЯ ТОЧНОГО КОНТРОЛЯ
+        # =========================================================================
+        
+        # Startup Probe - учитывает долгую инициализацию (5-10 секунд)
+        startupProbe:
+          httpGet:
+            path: /healthz    # Эндпоинт проверки старта приложения
+            port: 8080
+          failureThreshold: 8     # 8 попыток × 5 сек = 40 секунд максимум
+          periodSeconds: 5        # Щадящий интервал для снижения нагрузки на API
+          # 40 секунд дает значительный запас сверх заявленных 5-10 секунд
+          # для обработки непредвиденных задержек инициализации
+        
+        # Readiness Probe - определяет готовность к приему трафика
+        readinessProbe:
+          httpGet:
+            path: /ready      # Эндпоинт проверки готовности к работе
+            port: 8080
+          initialDelaySeconds: 15  # Дает время на базовую инициализацию перед проверками
+          periodSeconds: 10
+          failureThreshold: 3
+          # Более длинный initialDelay предотвращает преждевременное 
+          # включение в service mesh до полной готовности
+        
+        # Liveness Probe - определяет "живость" приложения
+        livenessProbe:
+          httpGet:
+            path: /live       # Эндпоинт проверки работоспособности
+            port: 8080
+          initialDelaySeconds: 30  # Значительная задержка для стабилизации приложения
+          periodSeconds: 15
+          failureThreshold: 3
+          # Большой initialDelay предотвращает перезапуски во время
+          # длительной инициализации или временных проблем
+        
+        ports:
+        - containerPort: 8080
+          protocol: TCP
+        
+        env:
+        - name: LOG_LEVEL
+          value: "info"
+        - name: MEMORY_LIMIT
+          valueFrom:
+            resourceFieldRef:
+              resource: limits.memory
+        # Мониторинг: переменные для отслеживания лимитов в приложении
+
+---
+# ------------------------------------------------------------
+# HorizontalPodAutoscaler - адаптация к суточным циклам нагрузки
+# ------------------------------------------------------------
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: web-app-hpa
+  annotations:
+    # Документация: пояснение стратегии масштабирования
+    description: "HPA для суточных циклов нагрузки - пик днем, минимум ночью"
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: web-app
+  
+  # баланс экономии и отказоустойчивости
+  minReplicas: 2  # Минимум 2 реплики для отказоустойчивости при падении зоны
+  maxReplicas: 6  # Запас сверх пиковых 4 реплик для непредвиденных всплесков
+  
+  behavior:
+    # осторожное масштабирование вниз
+    scaleDown:
+      stabilizationWindowSeconds: 900  # 15 минут - предотвращает быстрое уменьшение
+      policies:
+      - type: Percent
+        value: 50    # Максимум 50% реплик за период
+        periodSeconds: 60
+      # Длительное окно стабилизации защищает от флаппинга
+      # и обеспечивает стабильность в ночное время
+    
+    # Быстрое реагирование на утренний пик
+    scaleUp:
+      stabilizationWindowSeconds: 60   # 1 минута - быстрое реагирование
+      policies:
+
+> ︎︎ ︎︎︎ ㅤ:
+- type: Percent
+        value: 100   # Может удвоить количество реплик за период
+        periodSeconds: 30
+      # Агрессивное масштабирование вверх для быстрого
+      # реагирования на утренний рост нагрузки
+  
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 50  # 50% для чувствительного масштабирования
+        # Обоснование: Низкий порог обеспечивает раннее масштабирование
+        # при росте нагрузки, но может увеличить количество реплик
+        # Компромисс: Предпочли производительность над экономией
+
+---
+# ------------------------------------------------------------
+# PodDisruptionBudget - защита при плановом обслуживании
+# ------------------------------------------------------------
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: web-app-pdb
+  annotations:
+    warning: "PDB minAvailable=2 может блокировать drain операций при только 2 репликах"
+spec:
+  minAvailable: 2  # Гарантирует доступность минимум 2 подов
+  selector:
+    matchLabels:
+      app: web-app
