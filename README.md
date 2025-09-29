@@ -1,2 +1,2 @@
 # testofatestofatestmindbox
-Тестовое задание Mindbox
+Тестовое задание Mindbox на позицию DevOps-инженера стажера
