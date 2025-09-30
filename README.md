@@ -1,2 +1,3 @@
 # testofatestofatestmindbox
 Тестовое задание Mindbox на позицию DevOps-инженера стажера
+https://docs.google.com/document/d/1Zl7Fj3HgLqc8Ecs_-W209S9UrpIbkji1_rgU9oK3jVU/mobilebasic#
